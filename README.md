@@ -109,7 +109,7 @@ powershell -ExecutionPolicy Bypass -File .\setup_shortcut.ps1 -PythonExe "C:\Pat
 
 ## 开源协议
 
-尚未添加 LICENSE。发布公开仓库前建议补充，例如 MIT License。
+本项目基于 [MIT License](LICENSE) 开源。
 
 ---
 
@@ -214,4 +214,4 @@ powershell -ExecutionPolicy Bypass -File .\setup_shortcut.ps1 -PythonExe "C:\Pat
 
 ## License
 
-No LICENSE file yet. Adding one (such as MIT) is recommended before publishing the public repository.
+This project is released under the [MIT License](LICENSE).
