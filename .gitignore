@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local runtime data and logs
+logs/
+*.log
+
+# API keys / environment files
+.env
+.env.*
+
+# Temporary files and local experiments
+_probe*.py
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Packaging / release output
+build/
+dist/
+*.spec
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Local reference repositories and private research notes
+_ref_*/
+notes-private/
+
+# Windows shortcut generation is machine-specific
+*.lnk
