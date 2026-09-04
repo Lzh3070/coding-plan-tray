@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import subprocess
 import threading
 import time
 import queue
@@ -267,8 +268,25 @@ class UsageStore:
             log.exception("Kimi fetch failed: %s", exc)
             self.set("kimi", Provider("Kimi", error=str(exc)))
 
+    @staticmethod
+    def _latest_env_key(name: str) -> str:
+        """Read the newest machine/user env value for a tray app started
+        from Explorer.  If the key is updated after the tray launches, the
+        process environment keeps the stale inherited value."""
+        current = os.environ.get(name, "")
+        try:
+            cmd = ("powershell", "-NoProfile", "-Command",
+                   f"[Environment]::GetEnvironmentVariable('{name}','Machine')")
+            latest = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=3, creationflags=0x08000000).stdout.strip()
+            if latest:
+                return latest
+        except Exception:
+            pass
+        return current
+
     def _fetch_glm(self) -> None:
-        key = os.environ.get("ZHIPU_API_KEY", "")
+        key = self._latest_env_key("ZHIPU_API_KEY")
         if not key:
             self.set("glm", Provider("GLM", error="未设置 ZHIPU_API_KEY"))
             return
@@ -277,6 +295,8 @@ class UsageStore:
                              timeout=15)
             r.raise_for_status()
             d = r.json()
+            if d.get("success") is False or (d.get("code") not in (None, 200, 0) and not d.get("data")):
+                raise RuntimeError(f"GLM API {d.get('code')}: {d.get('msg', '鉴权失败')}")
             data = d.get("data") or {}
             wins: list[Window] = []
             for lim in data.get("limits") or []:

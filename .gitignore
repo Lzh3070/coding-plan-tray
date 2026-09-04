@@ -16,6 +16,7 @@ logs/
 
 # Temporary files and local experiments
 _probe*.py
+_env_probe.py
 tmp/
 temp/
 *.tmp
