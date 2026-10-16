@@ -40,7 +40,9 @@ PORT = 26000
 POLL_INTERVAL = 300  # seconds
 
 KIMI_API = "https://api.kimi.com/coding/v1/usages"
+KIMI_ME_API = "https://api.kimi.com/coding/v1/me"
 GLM_API = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
+GEMINI_LOCAL_API = "http://127.0.0.1:8045/api/accounts"
 
 LOG_PATH.parent.mkdir(exist_ok=True)
 logging.basicConfig(
@@ -181,6 +183,7 @@ class Window:
     remaining: float
     pct: float          # usage percent 0-100
     reset_epoch: float  # unix timestamp of reset or 0
+    is_percentage: bool = False  # ratio-only quota; display percentages, not absolute units
 
     @property
     def reset_human(self) -> str:
@@ -201,11 +204,111 @@ class Provider:
     level: str = ""
     fetched_at: float = 0.0
 
+    @property
+    def long_term_window(self) -> Window | None:
+        """Weekly quota for legacy plans, otherwise the new monthly total."""
+        for label in ("周额度", "月度总额度"):
+            window = next((w for w in self.windows if w.label == label), None)
+            if window is not None:
+                return window
+        return None
+
+    @property
+    def is_exhausted(self) -> bool:
+        """True when the 5h or applicable long-term quota is exhausted."""
+        if not self.ok or not self.windows:
+            return False
+        candidates = [w for w in self.windows if w.label == "5小时额度"]
+        long_term = self.long_term_window
+        if long_term is not None:
+            candidates.append(long_term)
+        for w in candidates:
+            if w.remaining <= 0 or w.pct >= 100.0:
+                return True
+        return False
+
+
+def _iso_reset_epoch(value: Any) -> float:
+    """Convert an ISO-8601 reset timestamp to a local-displayable epoch."""
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _kimi_ratio_window(label: str, data: Any) -> Window | None:
+    """Build a percentage-only window from the new Kimi usages schema."""
+    if not isinstance(data, dict) or data.get("used_ratio") is None:
+        return None
+    used_pct = round(_num(data.get("used_ratio")) * 100.0, 2)
+    return Window(
+        label, 100.0, used_pct, round(100.0 - used_pct, 2), used_pct,
+        _iso_reset_epoch(data.get("reset_time")), True,
+    )
+
+
+def parse_kimi_payload(d: dict[str, Any]) -> tuple[list[Window], str]:
+    """Parse both legacy Kimi weekly plans and the new Max usages schema.
+
+    At most two rows are returned: the 5h window and one long-term window.
+    New ratio data wins for 5h; legacy weekly data wins over monthly total
+    when a transitional payload contains both. ``limit_month_code`` and
+    ``booster_wallet`` are intentionally not surfaced as subscription quota.
+    """
+    limits = d.get("limits") or []
+    usages = d.get("usages") or {}
+
+    legacy_5h: Window | None = None
+    for lim in limits:
+        window_info = lim.get("window") or {}
+        if (window_info.get("timeUnit") != "TIME_UNIT_MINUTE" or
+                _num(window_info.get("duration")) != 300):
+            continue
+        detail = lim.get("detail") or {}
+        limit = _num(detail.get("limit"))
+        if limit <= 0:
+            continue
+        used = _num(detail.get("used"))
+        remaining = _num(detail.get("remaining"))
+        legacy_5h = Window(
+            "5小时额度", limit, used, remaining, round(used / limit * 100.0, 2),
+            _iso_reset_epoch(detail.get("resetTime")),
+        )
+        break
+
+    five_hour = _kimi_ratio_window("5小时额度", usages.get("limit_5h")) or legacy_5h
+
+    weekly: Window | None = None
+    legacy_usage = d.get("usage") or {}
+    weekly_limit = _num(legacy_usage.get("limit"))
+    if weekly_limit > 0:
+        weekly_used = _num(legacy_usage.get("used"))
+        weekly = Window(
+            "周额度", weekly_limit, weekly_used, _num(legacy_usage.get("remaining")),
+            round(weekly_used / weekly_limit * 100.0, 2),
+            _iso_reset_epoch(legacy_usage.get("resetTime")),
+        )
+
+    monthly = _kimi_ratio_window("月度总额度", usages.get("limit_month_total"))
+    long_term = weekly or monthly
+    windows = [w for w in (five_hour, long_term) if w is not None]
+
+    user = d.get("user") or {}
+    membership = user.get("membership") or {}
+    level = str(membership.get("level") or "").replace("LEVEL_", "").title()
+    return windows, level
+
 
 class UsageStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._data: dict[str, Provider] = {"kimi": Provider("Kimi"), "glm": Provider("GLM")}
+        self._data: dict[str, Provider] = {
+            "kimi": Provider("Kimi"),
+            "glm": Provider("GLM"),
+            "gemini": Provider("Gemini"),
+        }
 
     def snapshot(self) -> dict[str, Provider]:
         with self._lock:
@@ -218,6 +321,7 @@ class UsageStore:
     def fetch_all(self) -> None:
         threading.Thread(target=self._fetch_kimi, daemon=True).start()
         threading.Thread(target=self._fetch_glm, daemon=True).start()
+        threading.Thread(target=self._fetch_gemini, daemon=True).start()
 
     def _fetch_kimi(self) -> None:
         key = os.environ.get("KIMI_API_KEY", "")
@@ -229,38 +333,15 @@ class UsageStore:
                              timeout=15)
             r.raise_for_status()
             d = r.json()
-            usage = d.get("usage") or {}
-            limits = d.get("limits") or []
-            wins: list[Window] = []
-            # subscription-period quota
-            top = (_num(usage.get("limit")), _num(usage.get("used")),
-                   _num(usage.get("remaining")))
-            if top[0] > 0:
-                rt = usage.get("resetTime", "")
-                rts = datetime.fromisoformat(rt.replace("Z", "+00:00")).timestamp() if rt else 0
-                wins.append(Window("周额度", top[0], top[1], top[2],
-                                   round(top[1] / top[0] * 100, 1), rts))
-            # 5-hour windows
-            for lim in limits:
-                det = lim.get("detail") or {}
-                w0 = lim.get("window") or {}
-                dur = w0.get("duration", 0)
-                unit = w0.get("timeUnit", "")
-                if unit == "TIME_UNIT_MINUTE":
-                    label = "5小时额度" if dur == 300 else (f"{int(dur)}分钟窗口" if dur < 60 else f"{int(dur // 60)}小时窗口")
-                elif unit == "TIME_UNIT_HOUR":
-                    label = f"{int(dur)}小时窗口"
-                else:
-                    label = f"{dur} {unit}"
-                l, u, rem = _num(det.get("limit")), _num(det.get("used")), _num(det.get("remaining"))
-                if l <= 0:
-                    continue
-                rt = det.get("resetTime", "")
-                rts = datetime.fromisoformat(rt.replace("Z", "+00:00")).timestamp() if rt else 0
-                wins.append(Window(label, l, u, rem, round(u / l * 100, 1), rts))
-            wins.sort(key=lambda w: 0 if "5小时" in w.label else 1)
-            level = (d.get("user", {}).get("membership", {}) or {}).get("level", "")
-            level = level.replace("LEVEL_", "").title() if level else ""
+            wins, level = parse_kimi_payload(d)
+            if not level:
+                try:
+                    me = requests.get(KIMI_ME_API, headers={"Authorization": f"Bearer {key}"},
+                                      timeout=15)
+                    me.raise_for_status()
+                    level = str((me.json() or {}).get("user_level_name") or "").strip()
+                except Exception as level_exc:  # quota data remains usable without a badge
+                    log.warning("Kimi level fallback failed: %s", level_exc)
             self.set("kimi", Provider("Kimi", True, windows=wins, level=level,
                                       fetched_at=time.time()))
             log.info("Kimi fetched: %s", [(w.label, w.used, w.limit) for w in wins])
@@ -324,12 +405,79 @@ class UsageStore:
             log.exception("GLM fetch failed: %s", exc)
             self.set("glm", Provider("GLM", error=str(exc)))
 
+    def _fetch_gemini(self) -> None:
+        """Read Gemini quota cached inside local Antigravity-Manager (port 8045).
+        Never calls /api/accounts/refresh to avoid creating extra Google requests."""
+        key = self._latest_env_key("GEMINI_API_KEY")
+        if not key:
+            self.set("gemini", Provider("Gemini", error="未设置 GEMINI_API_KEY"))
+            return
+        try:
+            headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+            r = requests.get(GEMINI_LOCAL_API, headers=headers, timeout=10)
+            if r.status_code == 401:
+                raise RuntimeError("Antigravity-Manager 鉴权失败（401）")
+            r.raise_for_status()
+            payload = r.json() or {}
+            accounts = payload.get("accounts") or []
+            cur_id = payload.get("current_account_id")
+            curr = next((a for a in accounts if a.get("id") == cur_id), None)
+            if not curr and accounts:
+                curr = accounts[0]
+            if not curr:
+                self.set("gemini", Provider("Gemini", error="无可用账号"))
+                return
+            quota = curr.get("quota") or {}
+            groups = quota.get("quota_groups") or []
+            # Pick the "Gemini Models" group; fallback to first group if missing
+            g = next((x for x in groups if "gemini" in str(x.get("display_name", "")).lower()), None)
+            if not g and groups:
+                g = groups[0]
+            buckets = (g.get("buckets") or []) if g else []
+            wins: list[Window] = []
+            for b in buckets:
+                w_kind = str(b.get("window", "")).lower()
+                if "5h" in w_kind or "5" in w_kind:
+                    label = "5小时额度"
+                elif "week" in w_kind:
+                    label = "周额度"
+                else:
+                    label = b.get("window") or "窗口额度"
+                rem_frac = float(b.get("remaining_fraction", 0.0) or 0.0)
+                rem_frac = max(0.0, min(1.0, rem_frac))
+                rem_pct = rem_frac * 100.0
+                used_pct = round((1.0 - rem_frac) * 100.0, 1)
+                rt_str = b.get("reset_time") or ""
+                rts = 0.0
+                if rt_str:
+                    try:
+                        rts = datetime.fromisoformat(rt_str.replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        rts = 0.0
+                # Store percentages in limit=100 so existing percentage logic works cleanly
+                wins.append(Window(label, 100.0, used_pct, round(rem_pct, 1), used_pct, rts))
+            wins.sort(key=lambda w: 0 if "5小时" in w.label else 1)
+            level = str(quota.get("subscription_tier") or curr.get("subscription_tier") or "").strip()
+            self.set("gemini", Provider("Gemini", True, windows=wins, level=level,
+                                        fetched_at=time.time()))
+            log.info("Gemini fetched: %s", [(w.label, w.used, w.limit) for w in wins])
+        except requests.exceptions.ConnectionError:
+            self.set("gemini", Provider("Gemini", error="未启动 Antigravity-Manager (8045)"))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Gemini fetch failed: %s", exc)
+            self.set("gemini", Provider("Gemini", error=str(exc)))
+
 
 def _num(v: Any) -> float:
     try:
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _fmt_pct(value: float) -> str:
+    """Keep ratio precision without noisy trailing zeroes."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 STORE = UsageStore()
@@ -432,8 +580,9 @@ class PopupCard:
                                font=("Microsoft YaHei UI", 16, "bold"))
         self._title.pack(pady=(_s(14), _s(4)), fill=tk.X)
 
-        self._rows: dict[str, list[tk.Widget]] = {"kimi": [], "glm": []}
-        for key, name, accent in (("kimi", "Kimi", CYAN), ("glm", "GLM", VIOLET)):
+        self._rows: dict[str, list[tk.Widget]] = {"kimi": [], "glm": [], "gemini": []}
+        AMBER = "#f59e0b"
+        for key, name, accent in (("kimi", "Kimi", CYAN), ("glm", "GLM", VIOLET), ("gemini", "Gemini", AMBER)):
             head = tk.Frame(f, bg=CARD, padx=_s(14), pady=_s(10))
             head.pack(fill=tk.X, padx=_s(12), pady=(_s(8), 0))
             lbl = tk.Label(head, text=name, bg=CARD, fg=accent,
@@ -444,7 +593,7 @@ class PopupCard:
             lvl.pack(side=tk.RIGHT)
             body = tk.Frame(f, bg=CARD, padx=_s(14), pady=_s(10))
             body.pack(fill=tk.X, padx=_s(12), pady=(0, _s(2)))
-            self._rows[key] = [head, body, lvl]
+            self._rows[key] = [head, body, lvl, lbl, accent]
 
         self._foot = tk.Label(f, text="", bg=BG, fg=MUTED,
                               font=("Microsoft YaHei UI", 10))
@@ -454,12 +603,16 @@ class PopupCard:
         if not self._root:
             return
         try:
-            for key in ("kimi", "glm"):
+            for key in ("kimi", "glm", "gemini"):
                 p = snap[key]
-                head, body, lvl_lbl = self._rows[key]
+                head, body, lvl_lbl, name_lbl, accent = self._rows[key]
+                exhausted = p.is_exhausted
+                name_lbl.config(fg="#6b7280" if exhausted else accent)
+                badge_text = (p.level or "") + (" · 已耗尽" if exhausted else "")
+                lvl_lbl.config(text=badge_text, fg="#ef4444" if exhausted else "#8b95a8")
+
                 for w in body.winfo_children():
                     w.destroy()
-                lvl_lbl.config(text=p.level or "")
                 if not p.ok:
                     tk.Label(body, text=p.error or "加载中…", bg="#151c2f", fg="#f87171",
                              font=("Microsoft YaHei UI", 13)).pack(anchor=tk.W)
@@ -469,22 +622,30 @@ class PopupCard:
                     row.pack(fill=tk.X, pady=_s(3))
                     top = tk.Frame(row, bg="#151c2f")
                     top.pack(fill=tk.X)
-                    tk.Label(top, text=win.label, bg="#151c2f", fg="#8b95a8",
+                    label_fg = "#6b7280" if exhausted else "#8b95a8"
+                    val_fg = "#9ca3af" if exhausted else "#e5e7eb"
+                    tk.Label(top, text=win.label, bg="#151c2f", fg=label_fg,
                              font=("Microsoft YaHei UI", 12)).pack(side=tk.LEFT)
-                    val = tk.Label(top,
-                                   text=f"{win.used:,.0f}/{win.limit:,.0f}  剩 {win.remaining:,.0f}",
-                                   bg="#151c2f", fg="#e5e7eb",
+                    if key == "gemini" or win.is_percentage:
+                        val_text = f"剩 {_fmt_pct(win.remaining)}%"
+                    else:
+                        val_text = f"{win.used:,.0f}/{win.limit:,.0f}  剩 {win.remaining:,.0f}"
+                    val = tk.Label(top, text=val_text, bg="#151c2f", fg=val_fg,
                                    font=("Microsoft YaHei UI", 12, "bold"))
                     val.pack(side=tk.RIGHT)
                     # progress bar
                     bar_bg = tk.Frame(row, bg="#1a2340", height=_s(6))
                     bar_bg.pack(fill=tk.X, pady=(_s(3), _s(1)))
                     pct = min(win.pct, 100)
-                    color = "#f87171" if pct >= 90 else "#fbbf24" if pct >= 70 else "#34d399"
+                    if exhausted:
+                        color = "#4b5563"
+                    else:
+                        color = "#f87171" if pct >= 90 else "#fbbf24" if pct >= 70 else "#34d399"
                     bar = tk.Frame(bar_bg, bg=color, height=_s(6), width=int(_s(300) * pct / 100))
                     bar.pack(side=tk.LEFT, anchor=tk.W)
-                    meta = tk.Label(row, text=f"已用 {win.pct:.0f}% · {win.reset_human}",
-                                    bg="#151c2f", fg="#8b95a8",
+                    meta_fg = "#6b7280" if exhausted else "#8b95a8"
+                    meta = tk.Label(row, text=f"已用 {_fmt_pct(win.pct)}% · {win.reset_human}",
+                                    bg="#151c2f", fg=meta_fg,
                                     font=("Microsoft YaHei UI", 11))
                     meta.pack(anchor=tk.W)
             latest = max((p.fetched_at for p in snap.values()), default=0)
@@ -527,6 +688,9 @@ h1{font-size:1.5rem;font-weight:600;margin-bottom:4px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
       padding:24px;display:flex;flex-direction:column;gap:16px;transition:border .2s}
 .card:hover{border-color:#3b4a6e}
+.card.exhausted{filter:grayscale(1);opacity:.6;border-color:#374151}
+.card.exhausted .dot{background:#6b7280!important}
+.card.exhausted .lvl{color:#9ca3af;border-color:#4b5563}
 .head{display:flex;align-items:center;gap:10px}
 .dot{width:10px;height:10px;border-radius:50%}
 .dot.ok{background:var(--green)}.dot.err{background:var(--red)}.dot.pend{background:var(--muted)}
@@ -554,32 +718,39 @@ button:hover{border-color:#4a5a80;background:#202b4a}
 </head>
 <body>
 <h1>Coding Plan 额度</h1>
-<div class="sub">Kimi · GLM — 每 5 分钟自动刷新 · 本地端口 __PORT__</div>
+<div class="sub">Kimi · GLM · Gemini — 每 5 分钟自动刷新 · 本地端口 __PORT__</div>
 <div class="grid" id="grid"></div>
 <button onclick="fetchData()">手动刷新</button>
 <div class="refresh" id="refresh"></div>
 <script>
 const PCT_COLOR = p => p>=90?'var(--red)':p>=70?'var(--yellow)':'var(--green)';
+const FMT_PCT = v => Number(Number(v).toFixed(2)).toString();
 function bar(p,color){return `<div class="bar"><div style="width:${Math.min(p,100)}%;background:${color}"></div></div>`}
 function card(p){
-  const dot = p.ok?'ok':'err';
+  const isEx = !!p.isExhausted;
+  const dot = isEx ? 'pend' : (p.ok ? 'ok' : 'err');
   let body='';
   if(p.error){ body=`<div class="err">${p.error}</div>`; }
   else if(!p.windows.length){ body=`<div class="err" style="color:var(--muted)">加载中…</div>`; }
   else{
     body = p.windows.map(w=>{
-      const color=PCT_COLOR(w.pct);
+      const color=isEx?'#6b7280':PCT_COLOR(w.pct);
+      const isGemini = p.name === 'Gemini';
+      const isPercentage = isGemini || w.isPercentage;
+      const valHtml = isPercentage
+        ? `<span class="win-val">剩 ${FMT_PCT(w.remaining)}%</span>`
+        : `<span class="win-val">${w.used.toLocaleString()} <small>/ ${w.limit.toLocaleString()}（剩 ${w.remaining.toLocaleString()}）</small></span>`;
       return `<div class="win">
         <div class="win-row"><span class="win-label">${w.label}</span>
-          <span class="win-val">${w.used.toLocaleString()} <small>/ ${w.limit.toLocaleString()}（剩 ${w.remaining.toLocaleString()}）</small></span></div>
+          ${valHtml}</div>
         ${bar(w.pct,color)}
-        <div class="meta">已用 ${w.pct}% · ${w.resetHuman||''}</div>
+        <div class="meta">已用 ${FMT_PCT(w.pct)}% · ${w.resetHuman||''}</div>
       </div>`;
     }).join('');
   }
-  return `<div class="card">
+  return `<div class="card ${isEx?'exhausted':''}">
     <div class="head"><span class="dot ${dot}"></span><span class="name">${p.name}</span>
-      ${p.level?`<span class="lvl">${p.level}</span>`:''}</div>
+      ${p.level?`<span class="lvl">${p.level}${isEx?' · 已耗尽':''}</span>`:''}</div>
     ${body}
   </div>`;
 }
@@ -607,15 +778,16 @@ class Handler(BaseHTTPRequestHandler):
             snap = STORE.snapshot()
             items = []
             latest = 0.0
-            for key in ("kimi", "glm"):
+            for key in ("kimi", "glm", "gemini"):
                 p = snap[key]
                 latest = max(latest, p.fetched_at)
                 items.append({
                     "name": p.name, "ok": p.ok, "error": p.error, "level": p.level,
+                    "isExhausted": p.is_exhausted,
                     "windows": [{
                         "label": w.label, "limit": w.limit, "used": w.used,
                         "remaining": w.remaining, "pct": w.pct,
-                        "resetHuman": w.reset_human,
+                        "resetHuman": w.reset_human, "isPercentage": w.is_percentage,
                     } for w in p.windows],
                 })
             body = json.dumps({"fetchedAt": latest, "providers": items},
@@ -677,13 +849,16 @@ def poll_loop():
 
 def _hover_text(snap: dict[str, Provider]) -> str:
     lines = ["Coding Plan 额度"]
-    for key in ("kimi", "glm"):
+    for key in ("kimi", "glm", "gemini"):
         p = snap[key]
         if not p.ok:
             lines.append(f"{p.name}: {p.error or '加载中…'}")
             continue
-        parts = [f"{w.label} 剩{w.remaining:,.0f}/{w.limit:,.0f}（{100 - w.pct:.0f}%）"
-                 for w in p.windows]
+        if key == "gemini":
+            parts = [f"{w.label} 剩{w.remaining:.1f}%" for w in p.windows]
+        else:
+            parts = [f"{w.label} 剩{w.remaining:,.0f}/{w.limit:,.0f}（{100 - w.pct:.0f}%）"
+                     for w in p.windows]
         lines.append(f"{p.name}: " + " · ".join(parts))
     return "\n".join(lines)
 
