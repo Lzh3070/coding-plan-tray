@@ -1,8 +1,11 @@
 import copy
 import unittest
 from datetime import datetime
+from unittest.mock import Mock, patch
 
-from main import Provider, parse_kimi_payload
+import requests
+
+from main import KIMI_API, KIMI_ME_API, Provider, UsageStore, parse_kimi_payload
 
 
 def epoch(value: str) -> float:
@@ -132,6 +135,60 @@ class KimiParserTests(unittest.TestCase):
         provider = Provider("Kimi", True, windows=windows)
         self.assertIsNone(provider.long_term_window)
         self.assertTrue(provider.is_exhausted)
+
+    def test_ratio_only_payload_reads_both_5h_and_weekly_windows(self):
+        payload = {"usages": {
+            "limit_5h": {"used_ratio": 0},
+            "limit_7d": {"used_ratio": "0.3125", "reset_time": "2026-11-23T00:00:00Z"},
+        }}
+        windows, _ = parse_kimi_payload(payload)
+
+        self.assertEqual([w.label for w in windows], ["5小时额度", "周额度"])
+        five_hour, weekly = windows
+        self.assertEqual((five_hour.remaining, five_hour.reset_epoch), (100.0, 0.0))
+        self.assertEqual((weekly.used, weekly.remaining), (31.25, 68.75))
+        self.assertEqual(weekly.reset_epoch, epoch("2026-11-23T00:00:00Z"))
+        self.assertTrue(weekly.is_percentage)
+
+    def test_zero_ratios_fall_back_to_nonzero_legacy_counters(self):
+        payload = copy.deepcopy(OLD_PAYLOAD)
+        payload["usage"].update(used="1000")
+        del payload["usage"]["remaining"]
+        payload["usages"] = {"limit_5h": {"used_ratio": 0}, "limit_7d": {"used_ratio": 0}}
+
+        windows, _ = parse_kimi_payload(payload)
+
+        self.assertEqual([w.remaining for w in windows], [60.0, 0.0])
+        self.assertTrue(Provider("Kimi", True, windows=windows).is_exhausted)
+
+    def test_malformed_ratios_do_not_create_quota_windows(self):
+        payload = {"usages": {
+            "limit_5h": {"used_ratio": "invalid"},
+            "limit_7d": {"used_ratio": "NaN"},
+            "limit_month_total": {"used_ratio": None},
+        }}
+        windows, _ = parse_kimi_payload(payload)
+
+        self.assertEqual(windows, [])
+
+    @patch.dict("os.environ", {"KIMI_API_KEY": "test-kimi-key"})
+    @patch("main.requests.get")
+    def test_quota_is_published_before_optional_membership_request(self, get):
+        store = UsageStore()
+        quota_before_me = []
+
+        def respond(url, **kwargs):
+            if url == KIMI_API:
+                return Mock(**{"json.return_value": NEW_MAX_PAYLOAD})
+            self.assertEqual(url, KIMI_ME_API)
+            quota_before_me.extend(store.snapshot()["kimi"].windows)
+            raise requests.Timeout("membership request timed out")
+
+        get.side_effect = respond
+        store._fetch_kimi()
+
+        self.assertEqual([w.label for w in quota_before_me], ["5小时额度", "月度总额度"])
+        self.assertEqual(store.snapshot()["kimi"].windows, quota_before_me)
 
 
 if __name__ == "__main__":
